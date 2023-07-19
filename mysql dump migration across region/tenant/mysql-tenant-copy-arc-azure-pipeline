@@ -1,0 +1,183 @@
+pipeline {
+    agent none
+
+    stages {
+        stage('Setting value') {
+            agent any
+            steps {
+                script {
+                    if (params.source_env == 'preprod') {
+                        sourceSlave = 'rrg-preprod'
+                        sourcesubs = 'c2d958e7-e8b9-4a6f-be0e-4434bd079a68'
+                        sourceLoginId = 'acr-credentials-rrg'
+                        sourceConfig = 'preprod-spok-00-aks'
+                        if(params.source_pod == 'pod1') {
+                            sourceHostCred = 'acr-creds-host-rrg1'
+                        }
+                        else {
+                            sourceHostCred = 'acr-creds-host-rrg2'
+                        }
+                    } else if (params.source_env == 'stage') {
+                        sourceSlave = 'rrg-preprod-latest-fr'
+                        sourcesubs = 'c2d958e7-e8b9-4a6f-be0e-4434bd079a68'
+                        sourceLoginId = 'acr-credentials-ford'
+                        sourceConfig = 'preprod-spok-01-aks'
+                    } else if (params.source_env == 'prod') {
+                        sourceSlave = 'azure-arc-prod-fr'
+                        sourcesubs = '0884bd1c-c609-40a3-9d99-3b71303d2f0b'
+                        sourceLoginId = 'acr-credentials-ford-prod'
+                        sourceConfig = 'prod-spok-00-aks'
+                    }
+                    env.source_Slave = sourceSlave
+                    env.source_Subs = sourcesubs
+                    env.source_Login_Id = sourceLoginId
+                    env.source_Host_Cred = sourceHostCred
+                    env.source_Config = sourceConfig
+                    env.tenant_Id = "861aedbb-44b4-4bcf-a125-49fa7baf1e26"
+
+                    if (params.destination_env == 'preprod') {
+                        destinationSlave = 'rrg-preprod'
+                        destinationSubs = 'c2d958e7-e8b9-4a6f-be0e-4434bd079a68'
+                        destinationLoginId = 'acr-credentials-rrg'
+                        if(params.destination_pod == 'pod1') {
+                            destinationHostCred = 'acr-creds-host-rrg1'
+                        }
+                        else {
+                            destinationHostCred = 'acr-creds-host-rrg2'
+                        }
+                        destinationRG = 'PREPROD'
+                        destinationVM = 'connector-box-rrg'
+                    } else if (params.destination_env == 'stage') {
+                        destinationSlave = 'rrg-preprod-latest-fr'
+                        destinationSubs = 'c2d958e7-e8b9-4a6f-be0e-4434bd079a68'
+                        destinationLoginId = 'acr-credentials-rrg'
+                        destinationHostCred = 'acr-creds-host-fr1'
+                        destinationRG = 'PREPROD'
+                        destinationVM = 'connector-box-rrg'
+                    } else if (params.destination_env == 'prod') {
+                        destinationSlave = 'azure-arc-prod-fr'
+                        destinationSubs = '0884bd1c-c609-40a3-9d99-3b71303d2f0b'
+                        destinationLoginId = 'acr-credentials-ford-prod'
+                        if(params.destination_pod == 'pod1') {
+                            destinationHostCred = 'acr-creds-host-prodfr1'
+                        }
+                        destinationRG = 'PROD'
+                        destinationVM = 'prod-arc-connector-00'
+                    }
+                    env.destination_Slave = destinationSlave
+                    env.destination_Subs = destinationSubs
+                    env.destination_Login_Id = destinationLoginId
+                    env.destination_Host_Cred = destinationHostCred
+                    env.destination_VM = destinationVM
+                    env.destination_RG = destinationRG
+                }
+            }
+        }
+
+        stage('Source Connection') {
+            agent {
+                node("${env.source_Slave}")
+            }
+            steps {
+                echo "Making connection to the source environment with slave: ${sourceSlave}"
+                script {
+                   withCredentials([usernamePassword(credentialsId: env.source_Login_Id, passwordVariable: 'PASSWORD', usernameVariable: 'USERNAME')]) {
+                      withEnv(['S_USERNAME=$USERNAME', 'S_PASSWORD=$PASSWORD']) {
+                          sh """
+                          az login --service-principal -u ${S_USERNAME} -p ${S_PASSWORD} --tenant ${env.tenant_Id}
+                          az account set -s ${env.source_Subs}
+                          """
+                      }
+                   }
+                }
+            }
+        }
+
+        stage('Source Schema Dump') {
+            agent {
+                node("${env.source_Slave}")
+            }
+            steps {
+                echo "Schema Dump to from ${source_db} to pod"
+                script {
+                    withCredentials([usernamePassword(credentialsId: env.source_Host_Cred, passwordVariable: 'PASSWORD', usernameVariable: 'USERNAME')]) {
+                        withEnv(['S_MYSQL_USERNAME=$USERNAME', 'S_MYSQL_PASSWORD=$PASSWORD']) {
+                            sh """
+                            kubectl config use-context ${source_Config}
+                            kubectl delete pod debug --ignore-not-found
+                            kubectl run debug --image=bitnami/mysql:latest --restart=Never --command -- sleep infinity
+                            kubectl wait --for=condition=Ready pod/debug
+                            kubectl exec debug -- bash -c "mysqldump --no-data --routines -P 3306 -h ${source_host} -u ${S_MYSQL_USERNAME} -p${S_MYSQL_PASSWORD} --set-gtid-purged=OFF --column-statistics=0 ${source_db} > /tmp/TenantMysqlDump.sql"
+                            kubectl cp debug:/tmp/TenantMysqlDump.sql /tmp/TenantMysqlDump.sql
+                            kubectl delete pod debug
+                            az storage blob upload --account-name preprodarcstorage --container-name test --name TenantMysqlDump.sql --type block --file /tmp/TenantMysqlDump.sql --overwrite
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Blob to Destination VM Upload') {
+            agent {
+                node("${env.destination_Slave}")
+            }
+            steps {
+                echo "Uploading the Blob file to VM"
+                script {
+                    withCredentials([
+                        usernamePassword(credentialsId: env.source_Login_Id, passwordVariable: 'SOURCE_PASSWORD', usernameVariable: 'SOURCE_USERNAME'),
+                        usernamePassword(credentialsId: env.destination_Login_Id, passwordVariable: 'DESTINATION_PASSWORD', usernameVariable: 'DESTINATION_USERNAME')
+                    ]) {
+                        sh """
+                        az login --service-principal -u ${SOURCE_USERNAME} -p ${SOURCE_PASSWORD} --tenant ${env.tenant_Id}
+                        az account set -s ${env.source_Subs}
+                        expiryTime=\$(date -u -d "+5 minutes" +%Y-%m-%dT%H:%MZ)
+                        accessKey=\$(az storage account keys list --account-name preprodarcstorage --query "[?keyName=='key1'].value" --output tsv)
+                        sasToken=\$(az storage blob generate-sas --connection-string "DefaultEndpointsProtocol=https;AccountName=preprodarcstorage;AccountKey=\$accessKey;EndpointSuffix=core.windows.net" --container-name test --name TenantMysqlDump.sql --permissions r --expiry \$expiryTime --https-only --output tsv)
+                        az login --service-principal -u ${DESTINATION_USERNAME} -p ${DESTINATION_PASSWORD} --tenant ${env.tenant_Id}
+                        az account set -s ${env.destination_Subs}
+                        az vm extension set \\
+                            --resource-group ${env.destination_RG} \\
+                            --vm-name ${env.destination_VM} \\
+                            --name CustomScript \\
+                            --publisher Microsoft.Azure.Extensions \\
+                            --settings '{"commandToExecute": "wget -O azcopy.tar.gz https://aka.ms/downloadazcopy-v10-linux && tar -xf azcopy.tar.gz && sudo rm -f /tmp/azcopy && sudo cp azcopy_linux_amd64_*/azcopy /tmp/ && sudo chmod 755 /tmp/azcopy"}'
+                        echo "\$sasToken"
+                        az vm run-command invoke -g ${env.destination_RG} -n ${env.destination_VM} --command-id RunShellScript --scripts "/tmp/azcopy copy 'https://preprodarcstorage.blob.core.windows.net/test/TenantMysqlDump.sql?\$sasToken' '/tmp' --recursive"
+                        """
+                    }
+                }
+            }
+        }
+
+        stage('Destination Database Setup') {
+            agent {
+                node("${env.destination_Slave}")
+            }
+            steps {
+                echo "Creating Destination DB and importing dump file"
+                script {
+                    withCredentials([usernamePassword(credentialsId: env.destination_Host_Cred, passwordVariable: 'PASSWORD', usernameVariable: 'USERNAME')]) {
+                        withEnv(['D_MYSQL_USERNAME=$USERNAME', 'D_MYSQL_PASSWORD=$PASSWORD']) {
+                            sh """
+                            az vm run-command invoke -g ${destination_RG} -n ${destination_VM} --command-id RunShellScript --scripts "sudo sed -i "s/preprodArcCommon1Admin/${D_MYSQL_USERNAME}/" /tmp/TenantMysqlDump.sql"
+                            echo "Creating the destination database: ${destination_db}"
+                            az vm run-command invoke -g ${destination_RG} -n ${destination_VM} --command-id RunShellScript --scripts "mysql -P 3306 -h ${destination_host} -u ${D_MYSQL_USERNAME} -p${D_MYSQL_PASSWORD} -e 'CREATE DATABASE IF NOT EXISTS ${destination_db};'"
+                            echo "Copying the dump from slave to destination database"
+                            az vm run-command invoke -g ${destination_RG} -n ${destination_VM} --command-id RunShellScript --scripts "mysql -P 3306 -h ${destination_host} -u ${D_MYSQL_USERNAME} -p${D_MYSQL_PASSWORD} -D ${destination_db} < /tmp/TenantMysqlDump.sql"
+                            """
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Success Message') {
+            agent any
+            steps {
+                echo "Database dump from ${source_env} ${source_pod} to ${destination_env} ${destination_pod} completed successfully in DB : ${destination_db}"
+            }
+        }
+    }
+}

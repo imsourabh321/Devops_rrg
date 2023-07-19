@@ -1,0 +1,62 @@
+echo "start this jenkins jobs"
+
+sourcesubs="c2d958e7-e8b9-4a6f-be0e-4434bd079a68"
+sourceRG="PREPROD"
+sourceVM="connector-box-rrg"
+destinationSubs="d92ade56-83bf-49f9-ba74-dbb15614ae84"
+destinationRG="test"
+destinationVM="test-arc-connector-00"
+
+az login --service-principal -u $app_id -p $cert_id --tenant $tenent_id
+az account set --subscription $sourcesubs
+
+az vm run-command invoke -g $sourceRG -n $sourceVM --command-id RunShellScript --scripts "mysqldump -h '${source_host}' -u '${S_MYSQL_USERNAME}' -p'${S_MYSQL_PASSWORD}' --set-gtid-purged=OFF --single-transaction --column-statistics=0 '${source_db}' > /tmp/DealerMysqlDump.sql"
+az vm run-command invoke -g $sourceRG -n $sourceVM --command-id RunShellScript --scripts "mysqldump -h '${source_host}' -u '${S_MYSQL_USERNAME}' -p'${S_MYSQL_PASSWORD}' --set-gtid-purged=OFF --single-transaction --column-statistics=0 '${source_db_acc}' > /tmp/DealerAccMysqlDump.sql"
+az vm run-command invoke -g $sourceRG -n $sourceVM --command-id RunShellScript --scripts "mysqldump -h '${source_parts_host}' -u '${SP_MYSQL_USERNAME}' -p'${SP_MYSQL_PASSWORD}' --set-gtid-purged=OFF --single-transaction --column-statistics=0 '${source_db_parts}' > /tmp/DealerPartsMysqlDump.sql"
+
+expiryTime1=$(date -u -d "+5 minutes" +%Y-%m-%dT%H:%MZ)
+accessKey1=$(az storage account keys list --account-name preprodarcstorage --query "[?keyName=='key1'].value" --output tsv)
+sasToken1=$(az storage container generate-sas --account-name preprodarcstorage --account-key $accessKey1 --name test --permissions rw --expiry $expiryTime1 --https-only --output tsv)
+az vm extension set \
+    --resource-group $sourceRG \
+    --vm-name $sourceVM \
+    --name CustomScript \
+    --publisher Microsoft.Azure.Extensions \
+    --settings '{"commandToExecute": "wget -O azcopy.tar.gz https://aka.ms/downloadazcopy-v10-linux && tar -xf azcopy.tar.gz && sudo rm -f /tmp/azcopy && sudo cp azcopy_linux_amd64_*/azcopy /tmp/ && sudo chmod 755 /tmp/azcopy"}'
+az vm run-command invoke -g $sourceRG -n $sourceVM --command-id RunShellScript --scripts "/tmp/azcopy copy '/tmp/DealerMysqlDump.sql' 'https://preprodarcstorage.blob.core.windows.net/test?$sasToken1' --recursive"
+az vm run-command invoke -g $sourceRG -n $sourceVM --command-id RunShellScript --scripts "/tmp/azcopy copy '/tmp/DealerAccMysqlDump.sql' 'https://preprodarcstorage.blob.core.windows.net/test?$sasToken1' --recursive"
+az vm run-command invoke -g $sourceRG -n $sourceVM --command-id RunShellScript --scripts "/tmp/azcopy copy '/tmp/DealerPartsMysqlDump.sql' 'https://preprodarcstorage.blob.core.windows.net/test?$sasToken1' --recursive"
+
+expiryTime2=$(date -u -d "+5 minutes" +%Y-%m-%dT%H:%MZ)
+accessKey2=$(az storage account keys list --account-name preprodarcstorage --query "[?keyName=='key1'].value" --output tsv)
+sasToken2=$(az storage blob generate-sas --connection-string "DefaultEndpointsProtocol=https;AccountName=preprodarcstorage;AccountKey=$accessKey2;EndpointSuffix=core.windows.net" --container-name test --name DealerMysqlDump.sql --permissions r --expiry $expiryTime2 --https-only --output tsv)
+sasToken2acc=$(az storage blob generate-sas --connection-string "DefaultEndpointsProtocol=https;AccountName=preprodarcstorage;AccountKey=$accessKey2;EndpointSuffix=core.windows.net" --container-name test --name DealerAccMysqlDump.sql --permissions r --expiry $expiryTime2 --https-only --output tsv)
+sasToken2parts=$(az storage blob generate-sas --connection-string "DefaultEndpointsProtocol=https;AccountName=preprodarcstorage;AccountKey=$accessKey2;EndpointSuffix=core.windows.net" --container-name test --name DealerPartsMysqlDump.sql --permissions r --expiry $expiryTime2 --https-only --output tsv)
+
+az login --service-principal -u $app_id -p $cert_id --tenant $tenent_id
+az account set --subscription $destinationSubs
+
+az vm run-command invoke -g $destinationRG -n $destinationVM --command-id RunShellScript --scripts "/tmp/azcopy copy 'https://preprodarcstorage.blob.core.windows.net/test/DealerMysqlDump.sql?$sasToken2' '/tmp' --recursive"
+az vm run-command invoke -g $destinationRG -n $destinationVM --command-id RunShellScript --scripts "/tmp/azcopy copy 'https://preprodarcstorage.blob.core.windows.net/test/DealerAccMysqlDump.sql?$sasToken2acc' '/tmp' --recursive"
+az vm run-command invoke -g $destinationRG -n $destinationVM --command-id RunShellScript --scripts "/tmp/azcopy copy 'https://preprodarcstorage.blob.core.windows.net/test/DealerPartsMysqlDump.sql?$sasToken2parts' '/tmp' --recursive"
+
+az vm run-command invoke -g $destinationRG -n $destinationVM --command-id RunShellScript --scripts "sudo sed -i "s/preprodArcCommon1Admin/${D_MYSQL_USERNAME}/" /tmp/DealerMysqlDump.sql"
+az vm run-command invoke -g $destinationRG -n $destinationVM --command-id RunShellScript --scripts "sudo sed -i "s/preprodArcCommon1Admin/${D_MYSQL_USERNAME}/" /tmp/DealerAccMysqlDump.sql"
+az vm run-command invoke -g $destinationRG -n $destinationVM --command-id RunShellScript --scripts "sudo sed -i "s/preprodArcPartsCommon1Admin/${DP_MYSQL_USERNAME}/" /tmp/DealerPartsMysqlDump.sql"
+
+echo "Creating the destination database: ${destination_db}"
+echo "Creating the destination database: ${destination_db_acc}"
+echo "Creating the destination database: ${destination_db_parts}"
+
+az vm run-command invoke -g $destinationRG -n $destinationVM --command-id RunShellScript --scripts "mysql -P 3306 -h ${destination_host} -u ${D_MYSQL_USERNAME} -p${D_MYSQL_PASSWORD} -e 'CREATE DATABASE IF NOT EXISTS ${destination_db};'"
+az vm run-command invoke -g $destinationRG -n $destinationVM --command-id RunShellScript --scripts "mysql -P 3306 -h ${destination_host} -u ${D_MYSQL_USERNAME} -p${D_MYSQL_PASSWORD} -e 'CREATE DATABASE IF NOT EXISTS ${destination_db_acc};'"
+az vm run-command invoke -g $destinationRG -n $destinationVM --command-id RunShellScript --scripts "mysql -P 3306 -h ${destination_parts_host} -u ${DP_MYSQL_USERNAME} -p${DP_MYSQL_PASSWORD} -e 'CREATE DATABASE IF NOT EXISTS ${destination_db_parts};'"
+
+echo "Copying the dump from slave to destination database"
+az vm run-command invoke -g $destinationRG -n $destinationVM --command-id RunShellScript --scripts "mysql -P 3306 -h ${destination_host} -u ${D_MYSQL_USERNAME} -p${D_MYSQL_PASSWORD} -D ${destination_db} < /tmp/DealerMysqlDump.sql"
+az vm run-command invoke -g $destinationRG -n $destinationVM --command-id RunShellScript --scripts "mysql -P 3306 -h ${destination_host} -u ${D_MYSQL_USERNAME} -p${D_MYSQL_PASSWORD} -D ${destination_db_acc} < /tmp/DealerAccMysqlDump.sql"
+az vm run-command invoke -g $destinationRG -n $destinationVM --command-id RunShellScript --scripts "mysql -P 3306 -h ${destination_parts_host} -u ${DP_MYSQL_USERNAME} -p${DP_MYSQL_PASSWORD} -D ${destination_db_parts} < /tmp/DealerPartsMysqlDump.sql"
+
+echo "Database dump from ${source_env} to ${destination_env} completed successfully in DB : ${destination_db}"
+echo "Database dump from ${source_env} to ${destination_env} completed successfully in DB : ${destination_db_acc}"
+echo "Database dump from ${source_env} to ${destination_env} completed successfully in DB : ${destination_db_parts}"
